@@ -1,0 +1,303 @@
+"""Short SQLite transactions, serialized off the event loop; no network inside transactions."""
+import asyncio
+from contextlib import contextmanager
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import threading
+import time
+import uuid
+
+from .domain import Conflict, due_month
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
+CREATE TABLE IF NOT EXISTS users (
+ id INTEGER PRIMARY KEY, platform TEXT NOT NULL CHECK(platform IN ('tg','max')),
+ external_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, name TEXT NOT NULL DEFAULT '',
+ selected_group TEXT CHECK(selected_group IN ('active','completed')),
+ group_name TEXT CHECK(group_name IN ('active','completed')), subscribed_at REAL,
+ last_seen REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+ phone TEXT, pending_lead INTEGER, lead_id INTEGER UNIQUE, pipeline_id INTEGER,
+ crm_checked_at REAL, sync_reason TEXT NOT NULL DEFAULT 'Не привязан',
+ state TEXT NOT NULL DEFAULT '{}', UNIQUE(platform,external_id)
+);
+CREATE TABLE IF NOT EXISTS claims (
+ lead_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+ created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notes (
+ user_id INTEGER PRIMARY KEY REFERENCES users(id), lead_id INTEGER NOT NULL,
+ marker TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending', note_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS jobs (
+ id INTEGER PRIMARY KEY, key TEXT NOT NULL UNIQUE, lane TEXT NOT NULL, kind TEXT NOT NULL,
+ payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempts INTEGER NOT NULL DEFAULT 0,
+ available_at REAL NOT NULL, created_at REAL NOT NULL, error TEXT, result TEXT
+);
+CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(lane,status,available_at,id);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS campaigns (
+ id TEXT PRIMARY KEY, owner INTEGER NOT NULL REFERENCES users(id), audience TEXT NOT NULL,
+ payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS media (
+ id TEXT PRIMARY KEY, origin TEXT NOT NULL, source TEXT NOT NULL, kind TEXT NOT NULL,
+ name TEXT NOT NULL, path TEXT, tg_file TEXT, max_payload TEXT, error TEXT
+);
+CREATE TABLE IF NOT EXISTS audit (
+ id INTEGER PRIMARY KEY, created_at REAL NOT NULL, action TEXT NOT NULL, user_id INTEGER,
+ detail TEXT NOT NULL
+);
+PRAGMA user_version=1;
+"""
+
+
+class Store:
+    def __init__(self, path: str):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
+        self.conn.executescript(SCHEMA)
+
+    async def call(self, method, *args, **kwargs):
+        def run():
+            with self.lock:
+                return getattr(self, method)(*args, **kwargs)
+        return await asyncio.to_thread(run)
+
+    @contextmanager
+    def transaction(self):
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self.conn.execute("COMMIT")
+            except BaseException:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    def rows(self, sql, args=()):
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def one(self, sql, args=()):
+        r = self.conn.execute(sql, args).fetchone()
+        return dict(r) if r else None
+
+    def execute(self, sql, args=()):
+        return self.conn.execute(sql, args).rowcount
+
+    def setting(self, key, default=None):
+        row = self.one("SELECT value FROM settings WHERE key=?", (key,))
+        return json.loads(row["value"]) if row else default
+
+    def set_setting(self, key, value):
+        self.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                     (key, json.dumps(value, ensure_ascii=False)))
+
+    def audit(self, action, uid, detail):
+        self.execute("INSERT INTO audit(created_at,action,user_id,detail) VALUES (?,?,?,?)",
+                     (time.time(), action, uid, detail))
+
+    def enqueue(self, key, lane, kind, payload, delay=0):
+        now = time.time()
+        self.execute("INSERT OR IGNORE INTO jobs(key,lane,kind,payload,available_at,created_at) VALUES (?,?,?,?,?,?)",
+                     (key, lane, kind, json.dumps(payload, ensure_ascii=False), now + delay, now))
+
+    def ingest(self, platform, updates, cursor):
+        with self.transaction():
+            for raw in updates:
+                identity = str(raw["update_id"]) if platform == "tg" else hashlib.sha256(
+                    json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                self.enqueue(f"in:{platform}:{identity}", "inbox", "update", {"platform": platform, "raw": raw})
+            if cursor is not None:
+                self.set_setting(f"cursor:{platform}", cursor)
+
+    def recover(self):
+        with self.transaction():
+            # A killed process may have sent the external request. Never resend blindly.
+            self.execute("UPDATE jobs SET status='unknown',error='Process stopped during send' "
+                         "WHERE status='running' AND kind IN ('deliver','ui')")
+            self.execute("UPDATE jobs SET status='queued' WHERE status='running'")
+
+    def claim_job(self, lane):
+        with self.transaction():
+            row = self.one("SELECT * FROM jobs WHERE lane=? AND status='queued' AND available_at<=? "
+                           "ORDER BY id LIMIT 1", (lane, time.time()))
+            if row:
+                self.execute("UPDATE jobs SET status='running',attempts=attempts+1 WHERE id=?", (row["id"],))
+                row["attempts"] += 1
+                row["payload"] = json.loads(row["payload"])
+            return row
+
+    def finish_job(self, jid, status="done", error=None, delay=0, result=None):
+        self.execute("UPDATE jobs SET status=?,error=?,available_at=?,result=? WHERE id=?",
+                     (status, error, time.time() + delay, json.dumps(result), jid))
+
+    def touch_user(self, platform, external_id, chat_id, name):
+        self.execute("INSERT INTO users(platform,external_id,chat_id,name,last_seen) VALUES (?,?,?,?,?) "
+                     "ON CONFLICT(platform,external_id) DO UPDATE SET chat_id=excluded.chat_id, "
+                     "name=excluded.name,last_seen=excluded.last_seen",
+                     (platform, external_id, chat_id, name[:200], time.time()))
+        return self.one("SELECT * FROM users WHERE platform=? AND external_id=?", (platform, external_id))
+
+    def user(self, uid):
+        return self.one("SELECT * FROM users WHERE id=?", (uid,))
+
+    def state(self, uid, value):
+        self.execute("UPDATE users SET state=? WHERE id=?", (json.dumps(value), uid))
+
+    def start(self, uid, lead):
+        with self.transaction():
+            u = self.user(uid)
+            # Repeat /start never resets subscription, claim, phone or scheduler anchor.
+            if not u["lead_id"] and lead:
+                self.execute("UPDATE users SET pending_lead=? WHERE id=?", (lead, uid))
+            self.execute("UPDATE users SET active=1,state='{}' WHERE id=?", (uid,))
+
+    def reserve(self, uid, lead):
+        u = self.user(uid)
+        if not u or not u["subscribed_at"]:
+            raise Conflict("Сначала выберите группу")
+        if u["lead_id"] and u["lead_id"] != lead:
+            raise Conflict("Пользователь уже привязан к другой сделке")
+        row = self.one("SELECT * FROM claims WHERE lead_id=? OR user_id=?", (lead, uid))
+        if row and (row["user_id"] != uid or row["lead_id"] != lead):
+            raise Conflict("Сделка или пользователь уже закреплены")
+        self.execute("INSERT OR IGNORE INTO claims VALUES (?,?,?)", (lead, uid, time.time()))
+
+    def request_bind(self, uid, lead, actor=None):
+        with self.transaction():
+            self.reserve(uid, lead)
+            self.enqueue(f"bind:{uid}:{lead}", "crm", "bind", {"uid": uid, "lead": lead, "actor": actor})
+            self.execute("UPDATE users SET sync_reason='Проверка сделки' WHERE id=? AND lead_id IS NULL", (uid,))
+
+    def choose_group(self, uid, group):
+        if group not in ("active", "completed"):
+            raise ValueError("group")
+        with self.transaction():
+            u = self.user(uid)
+            self.execute("UPDATE users SET selected_group=?,group_name=CASE WHEN lead_id IS NULL THEN ? "
+                         "ELSE group_name END,subscribed_at=COALESCE(subscribed_at,?),active=1 WHERE id=?",
+                         (group, group, time.time(), uid))
+            if u["pending_lead"] and not u["lead_id"]:
+                try:
+                    self.reserve(uid, u["pending_lead"])
+                    self.enqueue(f"bind:{uid}:{u['pending_lead']}", "crm", "bind",
+                                 {"uid": uid, "lead": u["pending_lead"]})
+                    return "binding"
+                except Conflict:
+                    self.execute("UPDATE users SET sync_reason='Конфликт привязки' WHERE id=?", (uid,))
+                    return "conflict"
+            return "linked" if u["lead_id"] else "contact"
+
+    def phone_search(self, uid, phone):
+        with self.transaction():
+            u = self.user(uid)
+            if not u["subscribed_at"] or u["lead_id"] or u["pending_lead"]:
+                return False
+            self.execute("UPDATE users SET phone=?,sync_reason='Поиск по телефону' WHERE id=?", (phone, uid))
+            self.enqueue(f"phone:{uid}:{phone}", "crm", "phone", {"uid": uid, "phone": phone})
+            return True
+
+    def bind_verified(self, uid, lead, pipeline, completed_pipeline):
+        with self.transaction():
+            self.reserve(uid, lead)
+            self.execute("UPDATE users SET lead_id=?,pending_lead=NULL,pipeline_id=?,group_name=?, "
+                         "crm_checked_at=?,sync_reason='Синхронизирован' WHERE id=?",
+                         (lead, pipeline, "completed" if pipeline == completed_pipeline else "active", time.time(), uid))
+            marker = f"[sinai-subscription:{uid}:{lead}]"
+            self.execute("INSERT OR IGNORE INTO notes(user_id,lead_id,marker) VALUES (?,?,?)", (uid, lead, marker))
+            self.enqueue(f"note:{uid}:{lead}", "crm", "note", {"uid": uid})
+            self.audit("bind", uid, str(lead))
+
+    def invalid_lead(self, uid, lead):
+        with self.transaction():
+            self.execute("DELETE FROM claims WHERE user_id=? AND lead_id=? AND NOT EXISTS "
+                         "(SELECT 1 FROM users WHERE id=? AND lead_id IS NOT NULL)", (uid, lead, uid))
+            self.execute("UPDATE users SET pending_lead=NULL,sync_reason='Сделка не найдена' "
+                         "WHERE id=? AND lead_id IS NULL", (uid,))
+
+    def apply_crm(self, uid, lead, pipeline, completed_pipeline):
+        with self.transaction():
+            self.execute("UPDATE users SET pipeline_id=?,group_name=?,crm_checked_at=?,sync_reason='Синхронизирован' "
+                         "WHERE id=? AND lead_id=?", (pipeline, "completed" if pipeline == completed_pipeline else "active",
+                                                  time.time(), uid, lead))
+
+    def create_campaign(self, owner, audience):
+        cid = uuid.uuid4().hex[:16]
+        self.execute("INSERT INTO campaigns(id,owner,audience,payload,created_at) VALUES (?,?,?,?,?)",
+                     (cid, owner, audience, '{"text":"","media":[]}', time.time()))
+        return cid
+
+    def campaign(self, cid, owner=None):
+        r = self.one("SELECT * FROM campaigns WHERE id=?", (cid,))
+        if r and (owner is None or r["owner"] == owner):
+            r["payload"] = json.loads(r["payload"])
+            return r
+        return None
+
+    def edit_campaign(self, cid, owner, payload):
+        return self.execute("UPDATE campaigns SET payload=?,status='draft' WHERE id=? AND owner=? "
+                            "AND status IN ('draft','preview')", (json.dumps(payload, ensure_ascii=False), cid, owner))
+
+    def confirm_campaign(self, cid, owner):
+        with self.transaction():
+            c = self.campaign(cid, owner)
+            if not c or c["status"] != "preview":
+                return False
+            self.execute("UPDATE campaigns SET status='queued' WHERE id=?", (cid,))
+            self.enqueue(f"expand:{cid}", "bulk", "expand", {"cid": cid})
+            self.audit("campaign_confirm", owner, cid)
+            return True
+
+    def expand_campaign(self, cid):
+        with self.transaction():
+            c = self.campaign(cid)
+            if c["status"] not in ("queued", "sending"):
+                return
+            audience = c["audience"]
+            query = "SELECT id FROM users WHERE subscribed_at IS NOT NULL AND active=1"
+            args = ()
+            if audience in ("active", "completed"):
+                query += " AND group_name=?"
+                args = (audience,)
+            if audience == "unsynced":
+                query += " AND lead_id IS NULL"
+            for u in self.rows(query, args):
+                # Each media part has independent delivery status; no repeated earlier parts on retry.
+                parts = c["payload"].get("media", [])
+                if not parts:
+                    parts = [None]
+                for index, media in enumerate(parts):
+                    text = c["payload"]["text"] if index == 0 else ""
+                    self.enqueue(f"campaign:{cid}:{u['id']}:{index}", "delivery", "deliver",
+                                 {"uid": u["id"], "cid": cid, "text": text, "media": media, "part": index})
+            self.execute("UPDATE campaigns SET status='sending' WHERE id=?", (cid,))
+
+    def schedule(self, now, interval, tz):
+        with self.transaction():
+            for u in self.rows("SELECT * FROM users WHERE subscribed_at IS NOT NULL AND active=1"):
+                every = interval if u["group_name"] == "completed" else 1
+                month = due_month(u["subscribed_at"], now, every, tz)
+                if month is None:
+                    continue
+                self.enqueue(f"auto:{u['id']}:{month}", "delivery", "deliver", {"uid": u["id"], "month": month})
+
+    def stats(self):
+        users = self.one("SELECT COUNT(*) total, SUM(platform='tg') tg,SUM(platform='max') max, "
+                         "SUM(group_name='active') current,SUM(group_name='completed') completed, "
+                         "SUM(lead_id IS NOT NULL) synced,SUM(lead_id IS NULL) unsynced,SUM(active=1) active, "
+                         "SUM(last_seen>?) recent FROM users WHERE subscribed_at IS NOT NULL",
+                         (time.time() - 30 * 86400,))
+        jobs = self.rows("SELECT status,COUNT(*) n FROM jobs WHERE kind='deliver' GROUP BY status")
+        return users, {r["status"]: r["n"] for r in jobs}
+
+    def close(self):
+        self.conn.close()
+
