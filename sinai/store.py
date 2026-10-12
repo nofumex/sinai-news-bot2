@@ -4,10 +4,13 @@ from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import threading
 import time
 import uuid
+
+from filelock import FileLock
 
 from .domain import Conflict, due_month, message_parts, next_automatic_date
 
@@ -22,13 +25,14 @@ CREATE TABLE IF NOT EXISTS users (
  selected_group TEXT CHECK(selected_group IN ('active','completed')),
  group_name TEXT CHECK(group_name IN ('active','completed')), subscribed_at REAL,
  last_seen REAL NOT NULL, active INTEGER NOT NULL DEFAULT 1,
- phone TEXT, pending_lead INTEGER, lead_id INTEGER UNIQUE, pipeline_id INTEGER,
+ phone TEXT, pending_lead INTEGER, lead_id INTEGER, pipeline_id INTEGER,
  crm_checked_at REAL, sync_reason TEXT NOT NULL DEFAULT 'Не привязан',
- state TEXT NOT NULL DEFAULT '{}', UNIQUE(platform,external_id)
+ state TEXT NOT NULL DEFAULT '{}', UNIQUE(platform,external_id), UNIQUE(platform,lead_id), UNIQUE(id,platform)
 );
 CREATE TABLE IF NOT EXISTS claims (
- lead_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
- created_at REAL NOT NULL
+ lead_id INTEGER NOT NULL, platform TEXT NOT NULL CHECK(platform IN ('tg','max')),
+ user_id INTEGER NOT NULL UNIQUE, created_at REAL NOT NULL,
+ PRIMARY KEY(lead_id,platform), FOREIGN KEY(user_id,platform) REFERENCES users(id,platform)
 );
 CREATE TABLE IF NOT EXISTS notes (
  user_id INTEGER PRIMARY KEY REFERENCES users(id), lead_id INTEGER NOT NULL,
@@ -61,7 +65,6 @@ CREATE TABLE IF NOT EXISTS delivery_notes (
  snapshot TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', note_id INTEGER,
  error TEXT
 );
-PRAGMA user_version=1;
 """
 
 
@@ -71,7 +74,71 @@ class Store:
         self.conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
-        self.conn.executescript(SCHEMA)
+        try:
+            with FileLock(str(Path(path).resolve()) + '.migration.lock', timeout=30):
+                self.conn.executescript(SCHEMA)
+                self.migrate_platform_links(path)
+        except BaseException:
+            self.conn.close()
+            raise
+
+    def migrate_platform_links(self, path):
+        """Rebuild only legacy users/claims, without renaming referenced parent tables."""
+        columns = {r['name'] for r in self.conn.execute('PRAGMA table_info(claims)')}
+        global_lead_indexes = set()
+        for index in self.rows('PRAGMA index_list(users)'):
+            index_name = index['name'].replace('"', '""')
+            fields = self.rows(f'PRAGMA index_info("{index_name}")')
+            if index['unique'] and [f['name'] for f in fields] == ['lead_id']:
+                global_lead_indexes.add(index['name'])
+        if 'platform' in columns and not global_lead_indexes:
+            self.conn.execute('PRAGMA user_version=2')
+            return
+        # SQLite backup includes committed WAL contents. Never overwrite an earlier backup.
+        backup_path = Path(path).with_name(Path(path).name + f'.pre-platform-v2-{time.time_ns()}.backup')
+        with sqlite3.connect(backup_path) as backup:
+            self.conn.backup(backup)
+        self.conn.execute('PRAGMA foreign_keys=OFF')
+        try:
+            with self.transaction():
+                original = self.one("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")['sql']
+                ddl = re.sub(r'^CREATE TABLE\s+(?:IF NOT EXISTS\s+)?[\"`\[]?users[\"`\]]?',
+                             'CREATE TABLE users_platform_v2', original, count=1, flags=re.I)
+                ddl = re.sub(r'(\blead_id\s+INTEGER)\s+UNIQUE\b', r'\1', ddl, count=1, flags=re.I)
+                ddl = re.sub(r',\s*UNIQUE\s*\(\s*lead_id\s*\)', '', ddl, flags=re.I)
+                ddl = ddl.rstrip().rstrip(';').rstrip()
+                ddl = ddl[:-1] + ', UNIQUE(platform,lead_id), UNIQUE(id,platform))'
+                extras = self.rows("SELECT name,type,sql FROM sqlite_master WHERE tbl_name='users' "
+                                   "AND type IN ('index','trigger') AND sql IS NOT NULL")
+                self.conn.execute(ddl)
+                names = [r['name'] for r in self.conn.execute('PRAGMA table_info(users)')]
+                escaped = ','.join('"' + n.replace('"', '""') + '"' for n in names)
+                self.conn.execute(f'INSERT INTO users_platform_v2 ({escaped}) SELECT {escaped} FROM users')
+                self.conn.execute("CREATE TABLE claims_platform_v2 (lead_id INTEGER NOT NULL, "
+                                  "platform TEXT NOT NULL CHECK(platform IN ('tg','max')), user_id INTEGER NOT NULL UNIQUE, "
+                                  "created_at REAL NOT NULL, PRIMARY KEY(lead_id,platform), "
+                                  "FOREIGN KEY(user_id,platform) REFERENCES users(id,platform))")
+                self.conn.execute('INSERT INTO claims_platform_v2(lead_id,platform,user_id,created_at) '
+                                  'SELECT c.lead_id,u.platform,c.user_id,c.created_at FROM claims c JOIN users u ON u.id=c.user_id')
+                if self.one('SELECT COUNT(*) n FROM claims')['n'] != self.one('SELECT COUNT(*) n FROM claims_platform_v2')['n']:
+                    raise sqlite3.IntegrityError('Orphan claim: migration rolled back')
+                # Also restore reservations for a legacy bound user whose claim row was absent.
+                self.conn.execute('INSERT INTO claims_platform_v2(lead_id,platform,user_id,created_at) '
+                                  'SELECT lead_id,platform,id,COALESCE(subscribed_at,last_seen) FROM users u '
+                                  'WHERE lead_id IS NOT NULL AND NOT EXISTS '
+                                  '(SELECT 1 FROM claims_platform_v2 c WHERE c.user_id=u.id AND c.lead_id=u.lead_id)')
+                self.conn.execute('DROP TABLE claims')
+                self.conn.execute('DROP TABLE users')
+                self.conn.execute('ALTER TABLE users_platform_v2 RENAME TO users')
+                self.conn.execute('ALTER TABLE claims_platform_v2 RENAME TO claims')
+                for extra in extras:
+                    if extra['name'] not in global_lead_indexes:
+                        self.conn.execute(extra['sql'])
+                if self.rows('PRAGMA foreign_key_check'):
+                    raise sqlite3.IntegrityError('Foreign key check failed: migration rolled back')
+                self.conn.execute('PRAGMA user_version=2')
+        finally:
+            self.conn.execute('PRAGMA foreign_keys=ON')
 
     async def call(self, method, *args, **kwargs):
         def run():
@@ -255,15 +322,22 @@ class Store:
             self.execute("UPDATE users SET active=1,state='{}' WHERE id=?", (uid,))
 
     def reserve(self, uid, lead):
+        if not self.conn.in_transaction:
+            with self.transaction():
+                return self.reserve(uid, lead)
         u = self.user(uid)
         if not u or not u["subscribed_at"]:
             raise Conflict("Сначала выберите группу")
         if u["lead_id"] and u["lead_id"] != lead:
             raise Conflict("Пользователь уже привязан к другой сделке")
-        row = self.one("SELECT * FROM claims WHERE lead_id=? OR user_id=?", (lead, uid))
+        row = self.one("SELECT * FROM claims WHERE (lead_id=? AND platform=?) OR user_id=?", (lead, u['platform'], uid))
         if row and (row["user_id"] != uid or row["lead_id"] != lead):
             raise Conflict("Сделка или пользователь уже закреплены")
-        self.execute("INSERT OR IGNORE INTO claims VALUES (?,?,?)", (lead, uid, time.time()))
+        bound = self.one('SELECT id FROM users WHERE lead_id=? AND platform=? AND id<>?', (lead, u['platform'], uid))
+        if bound:
+            raise Conflict("Сделка или пользователь уже закреплены")
+        self.execute("INSERT OR IGNORE INTO claims(lead_id,platform,user_id,created_at) VALUES (?,?,?,?)",
+                     (lead, u['platform'], uid, time.time()))
 
     def request_bind(self, uid, lead, actor=None):
         with self.transaction():

@@ -199,7 +199,7 @@ def test_reconciliation_restores_missing_note_job_and_prevents_claim_conflict(en
     s.execute("DELETE FROM jobs WHERE kind='note'")
     s.reconcile_subscriptions()
     assert s.one("SELECT status FROM jobs WHERE kind='note'")['status'] == 'queued'
-    other = s.touch_user('max', 222, 222, 'Other')
+    other = s.touch_user('tg', 222, 222, 'Other')
     s.start(other['id'], 32426619)
     assert s.choose_group(other['id'], 'active') == 'conflict'
     assert s.one('SELECT user_id FROM claims')['user_id'] == uid
