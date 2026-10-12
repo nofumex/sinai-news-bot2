@@ -8,7 +8,7 @@ import pytest
 
 from sinai.config import Config
 from sinai.crm import AmoCRM
-from sinai.domain import WELCOME, next_automatic_date
+from sinai.domain import WELCOME, WELCOME_REGISTERED, STATUS_TEXT, next_automatic_date
 from sinai.engine import Engine
 from sinai.http import APIError
 from sinai.platforms import Platforms
@@ -50,7 +50,7 @@ async def test_start_exact_greeting_and_conditional_buttons(env, platform):
     anchor = s.user(u['id'])['subscribed_at']
     await ui.handle(job(start_update(platform=platform), 2, platform))
     second = json.loads(s.one("SELECT payload FROM jobs WHERE key='reply:2:1'")['payload'])
-    assert second['text'] == WELCOME
+    assert second['text'] == WELCOME_REGISTERED
     assert second['buttons'] is None
     assert s.user(u['id'])['subscribed_at'] == anchor
 
@@ -249,7 +249,7 @@ async def test_wire_start_sends_no_inline_keyboard_to_registered_user(env):
         await engine.ui.handle(job(start_update()))
         ui_job = s.claim_job('ui_send')
         await engine.dispatch(ui_job)
-    assert sent[0]['text'] == WELCOME
+    assert sent[0]['text'] == WELCOME_REGISTERED
     assert 'inline_keyboard' not in sent[0].get('reply_markup', {})
 
 
@@ -263,7 +263,7 @@ async def test_subscriber_messages_never_expose_crm_details(env):
     raw = start_update(uid=333, text='/status')
     await ui.handle(job(raw))
     text = json.loads(s.one("SELECT payload FROM jobs WHERE key='reply:1:1'")['payload'])['text']
-    assert 'Вы подписаны' in text
+    assert text == STATUS_TEXT
     assert not any(x in text.lower() for x in ('crm', 'сделк', 'привяз', 'синхрон'))
     engine = Engine(cfg, s, None, None)
     before = len(s.rows("SELECT * FROM jobs WHERE kind='ui'"))

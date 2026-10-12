@@ -4,7 +4,9 @@ import json
 import re
 import uuid
 
-from .domain import Conflict, WELCOME, max_contact_phone, normalize_phone, subscription_date
+from .domain import (Conflict, WELCOME, WELCOME_REGISTERED, SUBSCRIBED_TEXT, CONTACT_TEXT,
+                     STATUS_TEXT, STOP_TEXT, NOT_SUBSCRIBED_TEXT,
+                     max_contact_phone, normalize_phone, subscription_date)
 from .platforms import event
 
 GROUPS = {"active": "Действующие", "completed": "Завершённые", "all": "Все подписчики", "unsynced": "Несинхронизированные"}
@@ -89,11 +91,12 @@ class UI:
             payload = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             lead = int(payload) if re.fullmatch(r"[1-9][0-9]{0,17}", payload) else None
             await self.store.call("start", u["id"], lead)
-            await say(WELCOME, self.group_buttons() if u['selected_group'] is None else None)
+            await say(WELCOME if u['selected_group'] is None else WELCOME_REGISTERED,
+                      self.group_buttons() if u['selected_group'] is None else None)
             return
         if command == "/stop" or callback == "stop":
             await self.store.call("execute", "UPDATE users SET active=0 WHERE id=?", (u["id"],))
-            await say("<b>Подписка приостановлена.</b>\nВозобновить: /start")
+            await say(STOP_TEXT)
             return
         if command in ("/admin", "/message") or (callback and callback.startswith(("admin", "uns:", "card:", "bind:", "interval:", "new", "draft:", "preview:", "confirm:", "cancel:", "progress:", "jobs", "retry:", "sync"))):
             if not self.is_admin(u):
@@ -111,32 +114,32 @@ class UI:
             result = await self.store.call("choose_group", u["id"], group)
             await self.store.call("state", u["id"], {})
             if result == "contact":
-                await say("<b>Вы подписаны ✓</b>\nПоделитесь своим контактом.", contact=True)
+                await say(CONTACT_TEXT, contact=True)
             else:
-                await say("<b>Вы подписаны ✓</b>")
+                await say(SUBSCRIBED_TEXT)
             return
         if callback == "profile" or command == "/status":
-            await say(("<b>Вы подписаны ✓</b>\nЗдесь вы будете получать важные новости компании «Синай»."
-                       if u['active'] else "<b>Подписка приостановлена.</b>\nВозобновить: /start")
-                      if u['subscribed_at'] else "Подпишитесь на новости компании «Синай»: /start",
+            await say((STATUS_TEXT if u['active'] else STOP_TEXT)
+                      if u['subscribed_at'] else NOT_SUBSCRIBED_TEXT,
                       [[("Приостановить рассылки", "stop")]])
             return
         if e.get("contact"):
             if not u["subscribed_at"]:
-                await say("Сначала выберите группу: /start")
+                await say("<b>Сначала выберите группу</b>\n\n/start")
                 return
             if u["lead_id"] or u["pending_lead"]:
-                await say("<b>Вы подписаны ✓</b>")
+                await say(SUBSCRIBED_TEXT)
                 return
             contact = e["contact"]
             phone = normalize_phone(contact.get("phone_number", "")) if u["platform"] == "tg" and contact.get("user_id") == u["external_id"] else None
             if u["platform"] == "max":
                 phone = max_contact_phone(contact, self.cfg.max_token, u["external_id"])
             if not phone:
-                await say("Не удалось подтвердить принадлежность номера. Используйте кнопку «Поделиться контактом».", contact=True)
+                await say("<b>Не удалось подтвердить принадлежность номера.</b>\n\n"
+                          "Используйте кнопку «Поделиться контактом».", contact=True)
                 return
             await self.store.call("phone_search", u["id"], phone)
-            await say("<b>Вы подписаны ✓</b>")
+            await say(SUBSCRIBED_TEXT)
             return
         if self.is_admin(u):
             state = json.loads(u["state"])
@@ -168,7 +171,7 @@ class UI:
             if state.get("mode") == "draft":
                 await self.update_draft(u, state["cid"], e, say)
                 return
-        await say("<b>Синай · новости и бонусная программа</b>\n/start — подписаться\n/status — моя подписка\n/stop — приостановить рассылки")
+        await say("<b>Синай · новости и бонусная программа</b>\n\n/start — подписаться\n/status — моя подписка\n/stop — приостановить рассылки")
 
     @staticmethod
     def group_buttons():

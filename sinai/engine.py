@@ -6,7 +6,8 @@ import random
 import time
 import uuid
 
-from .domain import ACTIVE_TEXT, COMPLETED_TEXT, Conflict, due_month, subscription_date, message_parts
+from .domain import (ACTIVE_TEXT, COMPLETED_TEXT, SUBSCRIBED_TEXT, CONTACT_TEXT, NOT_SUBSCRIBED_TEXT,
+                     Conflict, due_month, subscription_date, message_parts)
 from .http import APIError
 from .ui import UI
 
@@ -134,9 +135,9 @@ class Engine:
             ))
             legacy_profile = key.startswith('reply:') and p['text'].startswith('<b>Моя подписка</b>') and 'CRM:' in p['text']
             if legacy_reply or legacy_profile:
-                p = {**p, 'text': '<b>Вы подписаны ✓</b>' if u['subscribed_at'] else 'Подпишитесь на новости компании «Синай»: /start'}
+                p = {**p, 'text': SUBSCRIBED_TEXT if u['subscribed_at'] else NOT_SUBSCRIBED_TEXT}
                 if p.get('contact'):
-                    p['text'] += '\nПоделитесь своим контактом.'
+                    p['text'] = CONTACT_TEXT
             media = await self.store.call("one", "SELECT * FROM media WHERE id=?", (p["media"],)) if p.get("media") else None
             return await self.platforms.send(u, p["text"], p.get("buttons"), p.get("contact", False), media)
         if kind == "bind":
