@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY, created_at REAL NOT NULL, action TEXT NOT NULL, user_id INTEGER,
  detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS delivery_notes (
+ job_id INTEGER PRIMARY KEY REFERENCES jobs(id), marker TEXT NOT NULL UNIQUE,
+ user_id INTEGER NOT NULL REFERENCES users(id), lead_id INTEGER,
+ snapshot TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', note_id INTEGER,
+ error TEXT
+);
 PRAGMA user_version=1;
 """
 
@@ -138,14 +144,85 @@ class Store:
             return row
 
     def finish_job(self, jid, status="done", error=None, delay=0, result=None):
-        self.execute("UPDATE jobs SET status=?,error=?,available_at=?,result=? WHERE id=?",
-                     (status, error, time.time() + delay, json.dumps(result), jid))
-        if status in ('done', 'failed', 'unknown'):
-            job = self.one('SELECT kind,payload FROM jobs WHERE id=?', (jid,))
-            if job and job['kind'] == 'deliver':
-                payload = json.loads(job['payload'])
-                if 'month' in payload:
-                    self.queue_note(payload['uid'])
+        with self.transaction():
+            self.execute("UPDATE jobs SET status=?,error=?,available_at=?,result=? WHERE id=?",
+                         (status, error, time.time() + delay, json.dumps(result), jid))
+            if status in ('done', 'failed', 'unknown'):
+                job = self.one('SELECT * FROM jobs WHERE id=?', (jid,))
+                if job and job['kind'] == 'deliver':
+                    payload = json.loads(job['payload'])
+                    if 'month' in payload:
+                        self.queue_note(payload['uid'])
+                    if status == 'done':
+                        self.record_delivery_note(job)
+
+    def record_delivery_note(self, job, completed_interval=2):
+        """Snapshot confirmed sends only. Never enqueue a platform send during backfill."""
+        if job['kind'] != 'deliver' or job['status'] != 'done':
+            return False
+        if self.one('SELECT job_id FROM delivery_notes WHERE job_id=?', (job['id'],)):
+            return False
+        p = json.loads(job['payload'])
+        u = self.user(p['uid'])
+        result = json.loads(job['result'] or 'null') or {}
+        if not isinstance(result, dict):
+            result = {}
+        saved = result.get('_sinai_delivery') or {}
+        message = result.get('message') or result
+        body = message.get('body') or {}
+        # Automatic payloads historically contain only uid/month, so use the actual API receipt.
+        text = saved.get('text', p.get('text'))
+        if text is None:
+            text = body.get('text') if 'text' in body else message.get('text', message.get('caption'))
+        sent_at = saved.get('sent_at')
+        source = saved.get('time_source')
+        if sent_at is None and message.get('timestamp'):
+            sent_at, source = message['timestamp'] / 1000, 'ответ платформы'
+        if sent_at is None and message.get('date'):
+            sent_at, source = message['date'], 'ответ платформы'
+        if sent_at is None:
+            sent_at, source = job['available_at'], 'время фиксации подтверждения отправки в SQLite'
+        every = saved.get('interval') or (self.setting('completed_interval', completed_interval) if u['group_name'] == 'completed' else 1)
+        consumed = self.one("SELECT MAX(CAST(json_extract(payload,'$.month') AS INTEGER)) month FROM jobs "
+                            "WHERE kind='deliver' AND json_extract(payload,'$.uid')=? AND available_at<=? "
+                            "AND status IN ('done','unknown','failed')", (u['id'], sent_at + 1))
+        last_month = max(p.get('month', 0), (consumed or {}).get('month') or 0)
+        next_at = next_automatic_date(u['subscribed_at'], sent_at, every, 'Asia/Krasnoyarsk', last_month)
+        platform = saved.get('platform', u['platform'])
+        external_id = saved.get('external_id', u['external_id'])
+        lead = saved.get('lead_id', u['lead_id'])
+        marker = f"[sinai-delivery:{platform}:{external_id}:{job['key']}]"
+        snapshot = {'platform': platform, 'external_id': external_id, 'sent_at': sent_at,
+                    'time_source': source, 'text': text, 'month': p.get('month'), 'cid': p.get('cid'),
+                    'part': p.get('part'), 'media': p.get('media'), 'next_at': next_at,
+                    'interval_source': 'на момент отправки' if saved else 'текущие настройки при восстановлении',
+                    'recovered': not bool(saved)}
+        status = 'pending' if lead else 'waiting_link'
+        error = None
+        if text is None:
+            status, error = 'incomplete', 'Full sent text absent from stored API receipt; no text invented'
+        self.execute('INSERT OR IGNORE INTO delivery_notes(job_id,marker,user_id,lead_id,snapshot,status,error) '
+                     'VALUES (?,?,?,?,?,?,?)', (job['id'], marker, u['id'], lead, json.dumps(snapshot, ensure_ascii=False), status, error))
+        if status == 'pending':
+            self.enqueue(f"delivery_note:{job['id']}", 'crm_history', 'delivery_note', {'job_id': job['id']})
+            self.queue_note(u['id'])
+        return True
+
+    def backfill_delivery_notes(self, limit=500, completed_interval=2):
+        with self.transaction():
+            jobs = self.rows("SELECT j.* FROM jobs j WHERE j.kind='deliver' AND j.status='done' "
+                             "AND NOT EXISTS (SELECT 1 FROM delivery_notes n WHERE n.job_id=j.id) "
+                             "ORDER BY j.id LIMIT ?", (limit,))
+            for job in jobs:
+                self.record_delivery_note(job, completed_interval)
+            for note in self.rows("SELECT n.job_id,u.lead_id FROM delivery_notes n JOIN users u ON u.id=n.user_id "
+                                  "WHERE n.status='waiting_link' AND u.lead_id IS NOT NULL LIMIT ?", (limit,)):
+                self.execute("UPDATE delivery_notes SET lead_id=?,status='pending' WHERE job_id=?", (note['lead_id'], note['job_id']))
+                self.enqueue(f"delivery_note:{note['job_id']}", 'crm_history', 'delivery_note', {'job_id': note['job_id']})
+            # Repair a missing note job, retaining backoff and ambiguous POST state.
+            for note in self.rows("SELECT job_id FROM delivery_notes WHERE status IN ('pending','writing','unknown') LIMIT ?", (limit,)):
+                self.enqueue(f"delivery_note:{note['job_id']}", 'crm_history', 'delivery_note', {'job_id': note['job_id']})
+            return len(jobs)
 
     def touch_user(self, platform, external_id, chat_id, name):
         self.execute("INSERT INTO users(platform,external_id,chat_id,name,last_seen) VALUES (?,?,?,?,?) "

@@ -72,7 +72,9 @@ class Engine:
                 sending = job["kind"] in ("deliver", "ui")
                 if exc.uncertain and sending:
                     status = "unknown"
-                elif (exc.retryable or (exc.uncertain and job['kind'] == 'note')) and (job["attempts"] < 12 or job["kind"] == "note"):
+                elif job['kind'] == 'delivery_note':
+                    status = 'queued'  # Retry only CRM history, including after credentials/permissions are fixed.
+                elif (exc.retryable or (exc.uncertain and job['kind'] in ('note', 'delivery_note'))) and (job["attempts"] < 12 or job["kind"] in ('note', 'delivery_note')):
                     status = "queued"
                 else:
                     status = "failed"
@@ -150,6 +152,8 @@ class Engine:
                 await self.store.call("execute", "UPDATE users SET sync_reason=? WHERE id=? AND lead_id IS NULL", (reason, u["id"]))
         elif kind == "note":
             await self.crm.ensure_note(p["uid"])
+        elif kind == 'delivery_note':
+            await self.crm.ensure_delivery_note(p['job_id'])
         elif kind == "sync":
             # Catalog changes and current states; fan out per-lead jobs to avoid one huge retry.
             catalog = [x async for x in self.crm.collection("/api/v4/leads/pipelines", "pipelines")]
@@ -232,12 +236,21 @@ class Engine:
                 raise APIError("delivery", 429, "waiting_previous_part", 2)
             text = p["text"]
             media = await self.store.call("one", "SELECT * FROM media WHERE id=?", (p["media"],)) if p.get("media") else None
+        every = await self.store.call('setting', 'completed_interval', self.cfg.completed_interval) if u['group_name'] == 'completed' else 1
         try:
             result = await self.platforms.send(u, text, media=media)
         except APIError as exc:
             if exc.status == 403:
                 await self.store.call("execute", "UPDATE users SET active=0 WHERE id=?", (u["id"],))
             raise
+        # Preserve the exact content/recipient before group changes; no CRM request on delivery path.
+        receipt = result.get('message') or result
+        sent_at = receipt.get('date') if u['platform'] == 'tg' else (receipt.get('timestamp') or 0) / 1000
+        result = {**result, '_sinai_delivery': {
+            'platform': u['platform'], 'external_id': u['external_id'], 'lead_id': u['lead_id'],
+            'text': text, 'sent_at': sent_at or time.time(), 'interval': every,
+            'time_source': 'ответ платформы' if sent_at else 'время подтверждения API',
+        }}
         # Cache Telegram reusable file_id for uploads originating on MAX.
         if media and u["platform"] == "tg":
             field = {"image": "photo", "video": "video", "file": "document"}[media["kind"]]
@@ -283,6 +296,7 @@ class Engine:
             now = time.time()
             if now >= next_sync:
                 await self.store.call('reconcile_subscriptions')
+                await self.store.call('backfill_delivery_notes', completed_interval=self.cfg.completed_interval)
                 await self.store.call("enqueue", f"sync:{uuid.uuid4().hex}", "crm", "sync", {})
                 next_sync = now + self.cfg.sync_seconds
             interval = await self.store.call("setting", "completed_interval", self.cfg.completed_interval)
@@ -297,11 +311,14 @@ class Engine:
 
     async def run(self):
         await self.store.call("recover")
+        # At most 500 rows per transaction so UI remains responsive during a large restoration.
+        while await self.store.call('backfill_delivery_notes', completed_interval=self.cfg.completed_interval) == 500:
+            await asyncio.sleep(0)
         log.info("Starting polling and durable queue workers")
         async with asyncio.TaskGroup() as group:
             for platform in ("tg", "max"):
                 group.create_task(self.poller(platform))
-            for lane in ("inbox", "ui_send", "preview_send", "crm", "media", "bulk", "delivery"):
+            for lane in ("inbox", "ui_send", "preview_send", "crm", "crm_history", "media", "bulk", "delivery"):
                 group.create_task(self.worker(lane))
             group.create_task(self.scheduler())
 

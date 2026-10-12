@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 from .domain import normalize_phone, exact_subscription_date
@@ -152,4 +153,61 @@ class AmoCRM:
         if remote.get('entity_id') != lead_id or remote.get('params', {}).get('text') != expected_text:
             raise APIError('amocrm', 503, 'subscription_note_not_verified')
         await self.store.call('execute', "UPDATE notes SET status='done',note_id=? WHERE user_id=?", (remote['id'], uid))
+
+    async def ensure_delivery_note(self, job_id):
+        note = await self.store.call('one', 'SELECT * FROM delivery_notes WHERE job_id=?', (job_id,))
+        send = await self.store.call('one', 'SELECT status FROM jobs WHERE id=? AND kind=\'deliver\'', (job_id,))
+        if not note or not send or send['status'] != 'done' or not note['lead_id'] or note['status'] in ('done', 'incomplete'):
+            return
+        s = json.loads(note['snapshot'])
+        if s['text'] is None:
+            return
+        kind = 'Автоматическая рассылка' if s['month'] is not None else 'Ручная рассылка'
+        details = f"Месяц подписки: {s['month']}\n" if s['month'] is not None else f"Рассылка: {s['cid']}\n"
+        if s.get('part') is not None:
+            details += f"Часть сообщения: {s['part'] + 1}\n"
+        text = (f"Отправлено сообщение бота «Синай»\n"
+                f"Платформа: {'Telegram' if s['platform'] == 'tg' else 'MAX'}\n"
+                f"ID получателя: {s['external_id']}\n"
+                f"Дата и время отправки (Красноярск): {exact_subscription_date(s['sent_at'], 'Asia/Krasnoyarsk')}\n"
+                f"Источник времени: {s['time_source']}\n"
+                f"Тип рассылки: {kind}\n{details}"
+                f"Статус доставки: API подтвердил успешную отправку; прочтение не подтверждено\n"
+                f"Следующая автоматическая рассылка: {exact_subscription_date(s['next_at'], 'Asia/Krasnoyarsk')}\n")
+        if s.get('recovered'):
+            text += 'Восстановлено по подтверждённой отправке SQLite. Следующая дата рассчитана по текущим настройкам.\n'
+        if s.get('media'):
+            text += f"Вложение: {s['media']}\n"
+        text += f"\nПолный текст отправленного сообщения:\n{s['text']}\n\n{note['marker']}"
+        path = f"/api/v4/leads/{note['lead_id']}/notes"
+        remote = None
+        if note['note_id']:
+            remote = await self.api('GET', f"{path}/{note['note_id']}")
+        else:
+            async for candidate in self.collection(path, 'notes'):
+                if note['marker'] in candidate.get('params', {}).get('text', ''):
+                    remote = candidate
+                    break
+        if remote is None:
+            if note['status'] in ('writing', 'unknown'):
+                # POST might have succeeded; only reconcile until its marker appears.
+                raise APIError('amocrm', 503, 'delivery_note_reconciliation_pending')
+            await self.store.call('execute', "UPDATE delivery_notes SET status='writing' WHERE job_id=?", (job_id,))
+            try:
+                data = await self.api('POST', path, json=[{'note_type': 'common', 'params': {'text': text}}])
+            except APIError as exc:
+                await self.store.call('execute', 'UPDATE delivery_notes SET status=?,error=? WHERE job_id=?',
+                                      ('unknown' if exc.uncertain else 'pending', str(exc), job_id))
+                raise
+            receipt = data.get('_embedded', {}).get('notes', [])
+            if not receipt:
+                await self.store.call('execute', "UPDATE delivery_notes SET status='unknown' WHERE job_id=?", (job_id,))
+                raise APIError('amocrm', 503, 'delivery_note_response_missing', uncertain=True)
+            nid = receipt[0]['id']
+            await self.store.call('execute', 'UPDATE delivery_notes SET note_id=? WHERE job_id=?', (nid, job_id))
+            remote = await self.api('GET', f'{path}/{nid}')
+        if remote.get('entity_id') != note['lead_id'] or remote.get('params', {}).get('text') != text:
+            raise APIError('amocrm', 503, 'delivery_note_not_verified')
+        await self.store.call('execute', "UPDATE delivery_notes SET status='done',note_id=?,error=NULL WHERE job_id=?",
+                              (remote['id'], job_id))
 
