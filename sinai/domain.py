@@ -57,3 +57,18 @@ def due_month(subscribed_at: float, now: float, interval: int, tz: str) -> int |
 def subscription_date(stamp: float, tz: str) -> str:
     return datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M %Z")
 
+
+def message_parts(payload):
+    media = payload.get("media") or []
+    text = payload.get("text", "")
+    if not media:
+        return [{"text": text, "media": None}]
+    parts = []
+    first_caption = media[0].get("caption", "")
+    if text and first_caption and text != first_caption:
+        parts.append({"text": text, "media": None})
+    for index, part in enumerate(media):
+        caption = part.get("caption") or (text if index == 0 else "")
+        parts.append({"text": caption, "media": part["id"]})
+    return parts
+

@@ -7,7 +7,7 @@ name = "sinai-crm-bot"
 version = "1.0.0"
 description = "Polling Telegram/MAX subscriber bot with durable SQLite queues"
 requires-python = ">=3.12"
-dependencies = ["httpx>=0.28,<0.29", "python-dotenv>=1.0,<2", "python-dateutil>=2.9,<3", "phonenumbers>=9,<10", "filelock>=3.16,<4"]
+dependencies = ["httpx>=0.28,<0.29", "python-dotenv>=1.0,<2", "python-dateutil>=2.9,<3", "phonenumbers>=9,<10", "filelock>=3.16,<4", "tzdata>=2025.1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.25,<2", "ruff>=0.11,<1"]

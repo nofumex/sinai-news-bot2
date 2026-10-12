@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 
-from .domain import Conflict, due_month
+from .domain import Conflict, due_month, message_parts
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -174,7 +174,12 @@ class Store:
     def request_bind(self, uid, lead, actor=None):
         with self.transaction():
             self.reserve(uid, lead)
-            self.enqueue(f"bind:{uid}:{lead}", "crm", "bind", {"uid": uid, "lead": lead, "actor": actor})
+            key = f"bind:{uid}:{lead}"
+            self.enqueue(key, "crm", "bind", {"uid": uid, "lead": lead, "actor": actor})
+            self.execute("UPDATE jobs SET status='queued',attempts=0,available_at=0,payload=? "
+                         "WHERE key=? AND status IN ('failed','done') AND NOT EXISTS "
+                         "(SELECT 1 FROM users WHERE id=? AND lead_id=?)",
+                         (json.dumps({"uid": uid, "lead": lead, "actor": actor}), key, uid, lead))
             self.execute("UPDATE users SET sync_reason='Проверка сделки' WHERE id=? AND lead_id IS NULL", (uid,))
 
     def choose_group(self, uid, group):
@@ -256,6 +261,15 @@ class Store:
             self.audit("campaign_confirm", owner, cid)
             return True
 
+    def mark_preview(self, cid, owner, payload, version):
+        with self.transaction():
+            c = self.campaign(cid, owner)
+            if not c or c["status"] not in ("draft", "preview") or c["payload"] != payload:
+                return False
+            self.execute("UPDATE campaigns SET status='preview' WHERE id=?", (cid,))
+            self.set_setting(f"preview:{cid}", version)
+            return True
+
     def expand_campaign(self, cid):
         with self.transaction():
             c = self.campaign(cid)
@@ -271,13 +285,9 @@ class Store:
                 query += " AND lead_id IS NULL"
             for u in self.rows(query, args):
                 # Each media part has independent delivery status; no repeated earlier parts on retry.
-                parts = c["payload"].get("media", [])
-                if not parts:
-                    parts = [None]
-                for index, media in enumerate(parts):
-                    text = c["payload"]["text"] if index == 0 else ""
+                for index, part in enumerate(message_parts(c["payload"])):
                     self.enqueue(f"campaign:{cid}:{u['id']}:{index}", "delivery", "deliver",
-                                 {"uid": u["id"], "cid": cid, "text": text, "media": media, "part": index})
+                                 {"uid": u["id"], "cid": cid, **part, "part": index})
             self.execute("UPDATE campaigns SET status='sending' WHERE id=?", (cid,))
 
     def schedule(self, now, interval, tz):
@@ -286,6 +296,11 @@ class Store:
                 every = interval if u["group_name"] == "completed" else 1
                 month = due_month(u["subscribed_at"], now, every, tz)
                 if month is None:
+                    continue
+                consumed = self.one("SELECT MAX(CAST(json_extract(payload,'$.month') AS INTEGER)) month "
+                                    "FROM jobs WHERE kind='deliver' AND json_extract(payload,'$.uid')=? "
+                                    "AND status IN ('done','running','unknown')", (u['id'],))
+                if consumed and consumed['month'] is not None and consumed['month'] >= month:
                     continue
                 self.enqueue(f"auto:{u['id']}:{month}", "delivery", "deliver", {"uid": u["id"], "month": month})
 
