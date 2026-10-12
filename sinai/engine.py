@@ -98,18 +98,19 @@ class Engine:
         if job["kind"] == "ui":
             return  # Avoid recursive failed notifications.
         p = job["payload"]
-        uid = p.get("uid") or p.get("owner")
         if job["kind"] == "deliver":
             return  # Mass failures are available in admin statistics, not one alert per recipient.
-        if uid:
-            u = await self.store.call("user", uid)
-            if u:
+        # Diagnostics only concern an explicit administrative operation, never its subscriber.
+        owner = p.get('owner')
+        if owner:
+            u = await self.store.call("user", owner)
+            if u and self.ui.is_admin(u):
                 await self.ui.say(u, f"<b>Задача требует проверки</b>\n#{job['id']}: {escape(error)}\n"
-                                  "Подписка и выбранная группа сохранены. Администратор может проверить очередь.",
+                                  "Подробности доступны в очереди администратора.",
                                   key=f"error_notice:{job['id']}")
-        if p.get("actor") and p["actor"] != uid:
+        if p.get("actor") and p["actor"] != owner:
             actor = await self.store.call("user", p["actor"])
-            if actor:
+            if actor and self.ui.is_admin(actor):
                 await self.ui.say(actor, f"<b>Привязка не выполнена</b>\n{escape(error)}", key=f"actor_error:{job['id']}")
 
     async def dispatch(self, job):
@@ -118,6 +119,22 @@ class Engine:
             return await self.ui.handle(job)
         if kind == "ui":
             u = await self.store.call("user", p["uid"])
+            # Previously queued service replies must not expose CRM details after this update.
+            key = job.get('key', '')
+            if key.startswith(('bind_result:', 'phone_result:')):
+                raise Skipped()
+            if key.startswith('error_notice:') and not self.ui.is_admin(u):
+                raise Skipped()
+            legacy_reply = key.startswith('reply:') and any(fragment in p['text'] for fragment in (
+                'Группа по amoCRM:', 'Проверяем сделку в фоне.', 'для поиска существующей сделки',
+                'Ищем вашу сделку в фоне.', 'Привязка по ссылке', 'Для привязанных пользователей',
+                'Эта ссылка уже закреплена',
+            ))
+            legacy_profile = key.startswith('reply:') and p['text'].startswith('<b>Моя подписка</b>') and 'CRM:' in p['text']
+            if legacy_reply or legacy_profile:
+                p = {**p, 'text': '<b>Вы подписаны ✓</b>' if u['subscribed_at'] else 'Подпишитесь на новости компании «Синай»: /start'}
+                if p.get('contact'):
+                    p['text'] += '\nПоделитесь своим контактом.'
             media = await self.store.call("one", "SELECT * FROM media WHERE id=?", (p["media"],)) if p.get("media") else None
             return await self.platforms.send(u, p["text"], p.get("buttons"), p.get("contact", False), media)
         if kind == "bind":
@@ -131,8 +148,6 @@ class Engine:
                 await self.store.call("request_bind", u["id"], lead)
             else:
                 await self.store.call("execute", "UPDATE users SET sync_reason=? WHERE id=? AND lead_id IS NULL", (reason, u["id"]))
-                await self.ui.say(u, "<b>Подписка сохранена ✓</b>\n" + escape(reason) +
-                                  ". Автоматическая привязка не выполнена; вы получаете рассылки своей группы.", key=f"phone_result:{job['id']}")
         elif kind == "note":
             await self.crm.ensure_note(p["uid"])
         elif kind == "sync":
@@ -179,8 +194,6 @@ class Engine:
         if not lead.get("id") or "pipeline_id" not in lead:
             raise APIError("amocrm", 503, "lead_invalid_response")
         await self.store.call("bind_verified", u["id"], p["lead"], lead["pipeline_id"], self.cfg.completed_pipeline)
-        await self.ui.say(u, "<b>Подписка привязана к вашей сделке ✓</b>\nГруппа рассылок определяется по состоянию сделки в amoCRM.",
-                          key=f"bind_result:{u['id']}:{p['lead']}")
         if p.get("actor"):
             actor = await self.store.call("user", p["actor"])
             await self.ui.say(actor, f"<b>Привязка сохранена ✓</b>\nПользователь {u['platform'].upper()} {u['external_id']} → сделка {p['lead']}.",

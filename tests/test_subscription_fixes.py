@@ -251,3 +251,33 @@ async def test_wire_start_sends_no_inline_keyboard_to_registered_user(env):
         await engine.dispatch(ui_job)
     assert sent[0]['text'] == WELCOME
     assert 'inline_keyboard' not in sent[0].get('reply_markup', {})
+
+
+async def test_subscriber_messages_never_expose_crm_details(env):
+    cfg, s = env
+    ui = UI(cfg, s, None)
+    u = s.touch_user('tg', 333, 333, 'Subscriber')
+    s.start(u['id'], 32426619)
+    s.choose_group(u['id'], 'active')
+    s.bind_verified(u['id'], 32426619, 11037010, 8993570)
+    raw = start_update(uid=333, text='/status')
+    await ui.handle(job(raw))
+    text = json.loads(s.one("SELECT payload FROM jobs WHERE key='reply:1:1'")['payload'])['text']
+    assert 'Вы подписаны' in text
+    assert not any(x in text.lower() for x in ('crm', 'сделк', 'привяз', 'синхрон'))
+    engine = Engine(cfg, s, None, None)
+    before = len(s.rows("SELECT * FROM jobs WHERE kind='ui'"))
+    await engine.notify_job_error({'id':55,'kind':'note','payload':{'uid':u['id']}}, 'amocrm: HTTP 403')
+    assert len(s.rows("SELECT * FROM jobs WHERE kind='ui'")) == before
+
+
+async def test_successful_bind_does_not_send_service_notification(env):
+    cfg, s = env
+    u = s.touch_user('tg', 333, 333, 'Subscriber')
+    s.start(u['id'], 32426619)
+    s.choose_group(u['id'], 'active')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(FakeNotes())) as h:
+        engine = Engine(cfg, s, None, AmoCRM(cfg, s, h))
+        await engine.bind(s.claim_job('crm'))
+    assert s.user(u['id'])['lead_id'] == 32426619
+    assert not s.rows("SELECT * FROM jobs WHERE kind='ui'")

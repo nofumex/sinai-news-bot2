@@ -102,7 +102,7 @@ class UI:
             await self.admin(u, e, say)
             return
         if callback == "groups":
-            await say("<b>Выберите группу</b>\nДля привязанных пользователей группа определяется по amoCRM.", self.group_buttons())
+            await say("<b>Выберите подходящий вариант</b>", self.group_buttons())
             return
         if callback and callback.startswith("group:"):
             group = callback.split(":", 1)[1]
@@ -111,22 +111,14 @@ class UI:
             result = await self.store.call("choose_group", u["id"], group)
             await self.store.call("state", u["id"], {})
             if result == "contact":
-                await say("<b>Вы подписаны ✓</b>\nПоделитесь вашим контактом для поиска существующей сделки. "
-                          "Рассылки доступны и без привязки.", contact=True)
-            elif result == "binding":
-                await say("<b>Вы подписаны ✓</b>\nПроверяем сделку в фоне. Результат придёт отдельным сообщением.")
-            elif result == "conflict":
-                await say("<b>Вы подписаны ✓</b>\nЭта ссылка уже закреплена за другим пользователем. "
-                          "Рассылки вашей группы сохранены; обратитесь к администратору для проверки.")
+                await say("<b>Вы подписаны ✓</b>\nПоделитесь своим контактом.", contact=True)
             else:
-                current = await self.store.call("user", u["id"])
-                await say(f"<b>Вы подписаны ✓</b>\nГруппа по amoCRM: {GROUPS[current['group_name']]}")
+                await say("<b>Вы подписаны ✓</b>")
             return
         if callback == "profile" or command == "/status":
-            await say("<b>Моя подписка</b>\n" + (f"Группа: {GROUPS[u['group_name']]}\n"
-                      f"Дата: {subscription_date(u['subscribed_at'], self.cfg.timezone)}\n"
-                      f"CRM: {escape(u['sync_reason'])}\n"
-                      f"Рассылки: {'включены' if u['active'] else 'приостановлены'}" if u["subscribed_at"] else "Выберите группу: /start"),
+            await say(("<b>Вы подписаны ✓</b>\nЗдесь вы будете получать важные новости компании «Синай»."
+                       if u['active'] else "<b>Подписка приостановлена.</b>\nВозобновить: /start")
+                      if u['subscribed_at'] else "Подпишитесь на новости компании «Синай»: /start",
                       [[("Приостановить рассылки", "stop")]])
             return
         if e.get("contact"):
@@ -134,7 +126,7 @@ class UI:
                 await say("Сначала выберите группу: /start")
                 return
             if u["lead_id"] or u["pending_lead"]:
-                await say("Привязка по ссылке уже выполняется или сохранена. Контакт не требуется.")
+                await say("<b>Вы подписаны ✓</b>")
                 return
             contact = e["contact"]
             phone = normalize_phone(contact.get("phone_number", "")) if u["platform"] == "tg" and contact.get("user_id") == u["external_id"] else None
@@ -144,7 +136,7 @@ class UI:
                 await say("Не удалось подтвердить принадлежность номера. Используйте кнопку «Поделиться контактом».", contact=True)
                 return
             await self.store.call("phone_search", u["id"], phone)
-            await say("<b>Контакт подтверждён ✓</b>\nИщем вашу сделку в фоне. Вы уже получаете рассылки выбранной группы.")
+            await say("<b>Вы подписаны ✓</b>")
             return
         if self.is_admin(u):
             state = json.loads(u["state"])
