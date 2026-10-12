@@ -40,6 +40,8 @@ CREATE TABLE IF NOT EXISTS jobs (
  available_at REAL NOT NULL, created_at REAL NOT NULL, error TEXT, result TEXT
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(lane,status,available_at,id);
+CREATE INDEX IF NOT EXISTS jobs_delivery_period ON jobs(kind,json_extract(payload,'$.uid'),status,
+ CAST(json_extract(payload,'$.month') AS INTEGER));
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS campaigns (
  id TEXT PRIMARY KEY, owner INTEGER NOT NULL REFERENCES users(id), audience TEXT NOT NULL,
@@ -270,25 +272,29 @@ class Store:
             self.set_setting(f"preview:{cid}", version)
             return True
 
-    def expand_campaign(self, cid):
+    def expand_campaign(self, cid, after=0):
         with self.transaction():
             c = self.campaign(cid)
             if c["status"] not in ("queued", "sending"):
                 return
             audience = c["audience"]
-            query = "SELECT id FROM users WHERE subscribed_at IS NOT NULL AND active=1"
-            args = ()
+            query = "SELECT id FROM users WHERE subscribed_at IS NOT NULL AND active=1 AND id>?"
+            args = (after,)
             if audience in ("active", "completed"):
                 query += " AND group_name=?"
-                args = (audience,)
+                args += (audience,)
             if audience == "unsynced":
                 query += " AND lead_id IS NULL"
-            for u in self.rows(query, args):
+            batch = self.rows(query + " ORDER BY id LIMIT 500", args)
+            for u in batch:
                 # Each media part has independent delivery status; no repeated earlier parts on retry.
                 for index, part in enumerate(message_parts(c["payload"])):
                     self.enqueue(f"campaign:{cid}:{u['id']}:{index}", "delivery", "deliver",
                                  {"uid": u["id"], "cid": cid, **part, "part": index})
             self.execute("UPDATE campaigns SET status='sending' WHERE id=?", (cid,))
+            if len(batch) == 500:
+                cursor = batch[-1]['id']
+                self.enqueue(f'expand:{cid}:{cursor}', 'bulk', 'expand', {'cid': cid, 'after': cursor})
 
     def schedule(self, now, interval, tz):
         with self.transaction():
@@ -303,6 +309,8 @@ class Store:
                 if consumed and consumed['month'] is not None and consumed['month'] >= month:
                     continue
                 self.enqueue(f"auto:{u['id']}:{month}", "delivery", "deliver", {"uid": u["id"], "month": month})
+                self.execute("UPDATE jobs SET status='queued',available_at=?,attempts=0 WHERE key=? AND status='skipped'",
+                             (time.time(), f"auto:{u['id']}:{month}"))
 
     def stats(self):
         users = self.one("SELECT COUNT(*) total, SUM(platform='tg') tg,SUM(platform='max') max, "

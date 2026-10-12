@@ -56,7 +56,8 @@ class UI:
         return u["external_id"] == (self.cfg.admin_id if u["platform"] == "tg" else self.cfg.max_admin_id)
 
     async def say(self, u, text, buttons=None, contact=False, key=None, media=None):
-        await self.store.call("enqueue", key or f"ui:{uuid.uuid4().hex}", "ui_send", "ui",
+        lane = 'preview_send' if key and key.startswith('preview_send:') else 'ui_send'
+        await self.store.call("enqueue", key or f"ui:{uuid.uuid4().hex}", lane, "ui",
                               {"uid": u["id"], "text": text, "buttons": buttons, "contact": contact, "media": media})
 
     async def handle(self, job):
@@ -88,12 +89,7 @@ class UI:
             payload = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             lead = int(payload) if re.fullmatch(r"[1-9][0-9]{0,17}", payload) else None
             await self.store.call("start", u["id"], lead)
-            if u["subscribed_at"]:
-                await say("<b>Ваша подписка сохранена ✓</b>\n" +
-                          f"Группа: {GROUPS[u['group_name']]}. Дата подписки не меняется.",
-                          [[("Выбрать группу", "groups")], [("Моя подписка", "profile")]])
-            else:
-                await say(WELCOME, self.group_buttons())
+            await say(WELCOME, self.group_buttons())
             return
         if command == "/stop" or callback == "stop":
             await self.store.call("execute", "UPDATE users SET active=0 WHERE id=?", (u["id"],))
@@ -264,6 +260,7 @@ class UI:
                 await say("Черновик уже отправлен или отменён.", BACK)
                 return
             await self.store.call("state", u["id"], {"mode": "draft", "cid": cid})
+            await self.store.call('execute', "UPDATE campaigns SET status='draft' WHERE id=? AND owner=? AND status='preview'", (cid, u['id']))
             await self.draft_help(cid, say)
         elif cb.startswith("preview:"):
             cid = cb.split(":")[1]

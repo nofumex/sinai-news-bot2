@@ -72,7 +72,7 @@ class Engine:
                 sending = job["kind"] in ("deliver", "ui")
                 if exc.uncertain and sending:
                     status = "unknown"
-                elif exc.retryable and (job["attempts"] < 12 or job["kind"] == "note"):
+                elif (exc.retryable or (exc.uncertain and job['kind'] == 'note')) and (job["attempts"] < 12 or job["kind"] == "note"):
                     status = "queued"
                 else:
                     status = "failed"
@@ -158,7 +158,7 @@ class Engine:
         elif kind == "deliver":
             return await self.deliver(job)
         elif kind == "expand":
-            await self.store.call("expand_campaign", p["cid"])
+            await self.store.call("expand_campaign", p["cid"], p.get('after', 0))
         elif kind == "preview":
             await self.preview(job)
         else:
@@ -274,6 +274,8 @@ class Engine:
             await self.store.call("schedule", now, interval, self.cfg.timezone)
             await self.store.call("execute", "UPDATE campaigns SET status='done' WHERE status='sending' "
                                   "AND NOT EXISTS (SELECT 1 FROM jobs WHERE key LIKE 'campaign:' || campaigns.id || ':%' "
+                                  "AND status IN ('queued','running')) AND NOT EXISTS "
+                                  "(SELECT 1 FROM jobs WHERE kind='expand' AND json_extract(payload,'$.cid')=campaigns.id "
                                   "AND status IN ('queued','running'))")
             await self.store.call("set_setting", "heartbeat", now)
             await self.pause(15)
@@ -284,7 +286,7 @@ class Engine:
         async with asyncio.TaskGroup() as group:
             for platform in ("tg", "max"):
                 group.create_task(self.poller(platform))
-            for lane in ("inbox", "ui_send", "crm", "media", "bulk", "delivery"):
+            for lane in ("inbox", "ui_send", "preview_send", "crm", "media", "bulk", "delivery"):
                 group.create_task(self.worker(lane))
             group.create_task(self.scheduler())
 

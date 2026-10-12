@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 import signal
 import ssl
@@ -48,6 +49,7 @@ def cli():
     logging.getLogger("httpcore").setLevel(logging.CRITICAL)
     try:
         cfg = Config.load()
+        logging.getLogger().setLevel(os.getenv('LOG_LEVEL', 'INFO').upper())
         lock = FileLock(str(Path(cfg.db_path).resolve()) + ".lock", timeout=0)
         with lock:
             asyncio.run(run(cfg))
