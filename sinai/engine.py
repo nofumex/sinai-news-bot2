@@ -168,6 +168,7 @@ class Engine:
         p = job["payload"]
         u = await self.store.call("user", p["uid"])
         if u["lead_id"] == p["lead"]:
+            await self.store.call('queue_note', u['id'])
             return
         try:
             lead = await self.crm.lead(p["lead"])
@@ -268,6 +269,7 @@ class Engine:
         while not self.stop.is_set():
             now = time.time()
             if now >= next_sync:
+                await self.store.call('reconcile_subscriptions')
                 await self.store.call("enqueue", f"sync:{uuid.uuid4().hex}", "crm", "sync", {})
                 next_sync = now + self.cfg.sync_seconds
             interval = await self.store.call("setting", "completed_interval", self.cfg.completed_interval)

@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 
-from .domain import Conflict, due_month, message_parts
+from .domain import Conflict, due_month, message_parts, next_automatic_date
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -140,6 +140,12 @@ class Store:
     def finish_job(self, jid, status="done", error=None, delay=0, result=None):
         self.execute("UPDATE jobs SET status=?,error=?,available_at=?,result=? WHERE id=?",
                      (status, error, time.time() + delay, json.dumps(result), jid))
+        if status in ('done', 'failed', 'unknown'):
+            job = self.one('SELECT kind,payload FROM jobs WHERE id=?', (jid,))
+            if job and job['kind'] == 'deliver':
+                payload = json.loads(job['payload'])
+                if 'month' in payload:
+                    self.queue_note(payload['uid'])
 
     def touch_user(self, platform, external_id, chat_id, name):
         self.execute("INSERT INTO users(platform,external_id,chat_id,name,last_seen) VALUES (?,?,?,?,?) "
@@ -160,6 +166,15 @@ class Store:
             # Repeat /start never resets subscription, claim, phone or scheduler anchor.
             if not u["lead_id"] and lead:
                 self.execute("UPDATE users SET pending_lead=? WHERE id=?", (lead, uid))
+                # Returning subscribers see no group buttons; their prior choice is sufficient.
+                if u['selected_group'] is not None:
+                    try:
+                        self.reserve(uid, lead)
+                        self.queue_bind(uid, lead)
+                    except Conflict:
+                        self.execute("UPDATE users SET sync_reason='Конфликт привязки' WHERE id=?", (uid,))
+            elif u['lead_id']:
+                self.queue_note(uid)
             self.execute("UPDATE users SET active=1,state='{}' WHERE id=?", (uid,))
 
     def reserve(self, uid, lead):
@@ -176,13 +191,49 @@ class Store:
     def request_bind(self, uid, lead, actor=None):
         with self.transaction():
             self.reserve(uid, lead)
-            key = f"bind:{uid}:{lead}"
-            self.enqueue(key, "crm", "bind", {"uid": uid, "lead": lead, "actor": actor})
-            self.execute("UPDATE jobs SET status='queued',attempts=0,available_at=0,payload=? "
-                         "WHERE key=? AND status IN ('failed','done') AND NOT EXISTS "
-                         "(SELECT 1 FROM users WHERE id=? AND lead_id=?)",
-                         (json.dumps({"uid": uid, "lead": lead, "actor": actor}), key, uid, lead))
+            self.queue_bind(uid, lead, actor)
             self.execute("UPDATE users SET sync_reason='Проверка сделки' WHERE id=? AND lead_id IS NULL", (uid,))
+
+    def queue_bind(self, uid, lead, actor=None):
+        key = f"bind:{uid}:{lead}"
+        payload = {"uid": uid, "lead": lead, "actor": actor}
+        self.enqueue(key, 'crm', 'bind', payload)
+        self.execute("UPDATE jobs SET status='queued',attempts=0,available_at=0,payload=? "
+                     "WHERE key=? AND status IN ('failed','done') AND NOT EXISTS "
+                     "(SELECT 1 FROM users WHERE id=? AND lead_id=?)", (json.dumps(payload), key, uid, lead))
+
+    def queue_note(self, uid):
+        u = self.user(uid)
+        if not u or not u['lead_id']:
+            return
+        lead = u['lead_id']
+        marker = f"[sinai-subscription:{uid}:{lead}]"
+        self.execute("INSERT OR IGNORE INTO notes(user_id,lead_id,marker) VALUES (?,?,?)", (uid, lead, marker))
+        key = f'note:{uid}:{lead}'
+        self.enqueue(key, 'crm', 'note', {'uid': uid})
+        # Retain retry/backoff of pending jobs, but reconcile previously terminal ones.
+        self.execute("UPDATE jobs SET status='queued',available_at=0,attempts=0 WHERE key=? AND status IN ('done','failed')", (key,))
+
+    def automatic_info(self, uid, interval, tz, now=None):
+        u = self.user(uid)
+        every = interval if u['group_name'] == 'completed' else 1
+        consumed = self.one("SELECT MAX(CAST(json_extract(payload,'$.month') AS INTEGER)) month FROM jobs "
+                            "WHERE kind='deliver' AND json_extract(payload,'$.uid')=? "
+                            "AND status IN ('done','running','unknown','failed')", (uid,))
+        last = (consumed or {}).get('month') or 0
+        return every, next_automatic_date(u['subscribed_at'], now or time.time(), every, tz, last)
+
+    def reconcile_subscriptions(self):
+        with self.transaction():
+            for u in self.rows("SELECT * FROM users WHERE subscribed_at IS NOT NULL"):
+                if u['lead_id']:
+                    self.queue_note(u['id'])
+                elif u['pending_lead'] and u['selected_group'] is not None:
+                    try:
+                        self.reserve(u['id'], u['pending_lead'])
+                        self.queue_bind(u['id'], u['pending_lead'])
+                    except Conflict:
+                        self.execute("UPDATE users SET sync_reason='Конфликт привязки' WHERE id=?", (u['id'],))
 
     def choose_group(self, uid, group):
         if group not in ("active", "completed"):
@@ -195,8 +246,7 @@ class Store:
             if u["pending_lead"] and not u["lead_id"]:
                 try:
                     self.reserve(uid, u["pending_lead"])
-                    self.enqueue(f"bind:{uid}:{u['pending_lead']}", "crm", "bind",
-                                 {"uid": uid, "lead": u["pending_lead"]})
+                    self.queue_bind(uid, u['pending_lead'])
                     return "binding"
                 except Conflict:
                     self.execute("UPDATE users SET sync_reason='Конфликт привязки' WHERE id=?", (uid,))
@@ -220,7 +270,7 @@ class Store:
                          (lead, pipeline, "completed" if pipeline == completed_pipeline else "active", time.time(), uid))
             marker = f"[sinai-subscription:{uid}:{lead}]"
             self.execute("INSERT OR IGNORE INTO notes(user_id,lead_id,marker) VALUES (?,?,?)", (uid, lead, marker))
-            self.enqueue(f"note:{uid}:{lead}", "crm", "note", {"uid": uid})
+            self.queue_note(uid)
             self.audit("bind", uid, str(lead))
 
     def invalid_lead(self, uid, lead):
@@ -235,6 +285,7 @@ class Store:
             self.execute("UPDATE users SET pipeline_id=?,group_name=?,crm_checked_at=?,sync_reason='Синхронизирован' "
                          "WHERE id=? AND lead_id=?", (pipeline, "completed" if pipeline == completed_pipeline else "active",
                                                   time.time(), uid, lead))
+            self.queue_note(uid)
 
     def create_campaign(self, owner, audience):
         cid = uuid.uuid4().hex[:16]

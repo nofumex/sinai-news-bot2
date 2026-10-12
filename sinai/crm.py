@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from .domain import normalize_phone, subscription_date
+from .domain import normalize_phone, exact_subscription_date
 from .http import APIError, RateLimit, request
 
 
@@ -89,22 +89,49 @@ class AmoCRM:
 
     async def ensure_note(self, uid):
         note = await self.store.call("one", "SELECT * FROM notes WHERE user_id=?", (uid,))
-        if note["status"] == "done":
+        u = await self.store.call('user', uid)
+        if not note or not u or not u['lead_id']:
             return
-        async for remote in self.collection(f"/api/v4/leads/{note['lead_id']}/notes", "notes"):
-            if note["marker"] in remote.get("params", {}).get("text", ""):
-                await self.store.call("execute", "UPDATE notes SET status='done',note_id=? WHERE user_id=?",
-                                      (remote["id"], uid))
-                return
+        interval = await self.store.call('setting', 'completed_interval', self.cfg.completed_interval)
+        every, next_at = await self.store.call('automatic_info', uid, interval, self.cfg.timezone)
+        stable_marker = f"[sinai-user:{u['platform']}:{u['external_id']}:{note['lead_id']}]"
+        text = (f'Подписался на бот «Синай»\n'
+                f"Платформа: {'Telegram' if u['platform'] == 'tg' else 'MAX'}\n"
+                f"ID пользователя: {u['external_id']}\n"
+                f"Дата и время подписки: {exact_subscription_date(u['subscribed_at'], self.cfg.timezone)}\n"
+                f"Группа рассылок: {'завершённые' if u['group_name'] == 'completed' else 'действующие'}\n"
+                f"Следующая автоматическая рассылка: {exact_subscription_date(next_at, self.cfg.timezone)}\n"
+                f"Периодичность рассылки: {'ежемесячно' if every == 1 else 'каждые 2 месяца'}\n"
+                f"{note['marker']}\n{stable_marker}")
+        remote = None
+        if note['note_id']:
+            try:
+                remote = await self.api('GET', f"/api/v4/leads/{note['lead_id']}/notes/{note['note_id']}")
+            except APIError as exc:
+                if exc.status != 404:
+                    raise
+        if remote is None:
+            async for candidate in self.collection(f"/api/v4/leads/{note['lead_id']}/notes", 'notes'):
+                old_text = candidate.get('params', {}).get('text', '')
+                if stable_marker in old_text or (note['marker'] in old_text and
+                                                  f"ID пользователя: {u['external_id']}\n" in old_text):
+                    remote = candidate
+                    break
+        if remote is not None:
+            if remote.get('entity_id') != note['lead_id'] or remote.get('note_type') != 'common':
+                raise APIError('amocrm', 409, 'subscription_note_mismatch')
+            # Persist the recovered ID before PATCH; retrying a PATCH is idempotent.
+            await self.store.call('execute', "UPDATE notes SET note_id=?,status='updating' WHERE user_id=?",
+                                  (remote['id'], uid))
+            if remote.get('params', {}).get('text') != text:
+                await self.api('PATCH', f"/api/v4/leads/{note['lead_id']}/notes/{remote['id']}",
+                               json={'note_type': 'common', 'params': {'text': text}})
+                remote = await self.api('GET', f"/api/v4/leads/{note['lead_id']}/notes/{remote['id']}")
+            await self.verify_note(uid, note['lead_id'], remote, text)
+            return
         if note["status"] in ("writing", "unknown"):
             # A lost POST response is reconciled by reads only, never another POST.
             raise APIError("amocrm", 503, "note_reconciliation_pending")
-        u = await self.store.call("user", uid)
-        text = (f"Подписка на официальный чат-бот компании «Синай»\n"
-                f"Бот: {'sinai_news_bot (Telegram)' if u['platform'] == 'tg' else 'Синай (MAX)'}\n"
-                f"Платформа: {'Telegram' if u['platform'] == 'tg' else 'MAX'}\n"
-                f"ID пользователя: {u['external_id']}\n"
-                f"Дата подписки: {subscription_date(u['subscribed_at'], self.cfg.timezone)}\n{note['marker']}")
         await self.store.call("execute", "UPDATE notes SET status='writing' WHERE user_id=?", (uid,))
         try:
             data = await self.api("POST", f"/api/v4/leads/{note['lead_id']}/notes",
@@ -117,6 +144,12 @@ class AmoCRM:
         if not notes:
             await self.store.call("execute", "UPDATE notes SET status='unknown' WHERE user_id=?", (uid,))
             raise APIError("amocrm", 503, "note_response_missing", uncertain=True)
-        await self.store.call("execute", "UPDATE notes SET status='done',note_id=? WHERE user_id=?",
-                              (notes[0]["id"], uid))
+        await self.store.call("execute", "UPDATE notes SET note_id=? WHERE user_id=?", (notes[0]['id'], uid))
+        remote = await self.api('GET', f"/api/v4/leads/{note['lead_id']}/notes/{notes[0]['id']}")
+        await self.verify_note(uid, note['lead_id'], remote, text)
+
+    async def verify_note(self, uid, lead_id, remote, expected_text):
+        if remote.get('entity_id') != lead_id or remote.get('params', {}).get('text') != expected_text:
+            raise APIError('amocrm', 503, 'subscription_note_not_verified')
+        await self.store.call('execute', "UPDATE notes SET status='done',note_id=? WHERE user_id=?", (remote['id'], uid))
 

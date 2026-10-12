@@ -89,7 +89,7 @@ class UI:
             payload = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             lead = int(payload) if re.fullmatch(r"[1-9][0-9]{0,17}", payload) else None
             await self.store.call("start", u["id"], lead)
-            await say(WELCOME, self.group_buttons())
+            await say(WELCOME, self.group_buttons() if u['selected_group'] is None else None)
             return
         if command == "/stop" or callback == "stop":
             await self.store.call("execute", "UPDATE users SET active=0 WHERE id=?", (u["id"],))
@@ -205,6 +205,7 @@ class UI:
             value = int(cb.split(":")[1])
             if value in (1, 2):
                 await self.store.call("set_setting", "completed_interval", value)
+                await self.store.call('reconcile_subscriptions')
                 await self.store.call("audit", "interval", u["id"], str(value))
             await say(f"<b>Интервал сохранён: {value} мес.</b>", BACK)
         elif cb == "sync":

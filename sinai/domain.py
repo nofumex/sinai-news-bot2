@@ -58,6 +58,19 @@ def subscription_date(stamp: float, tz: str) -> str:
     return datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M %Z")
 
 
+def next_automatic_date(subscribed_at, now, interval, tz, last_month=0):
+    anchor = datetime.fromtimestamp(subscribed_at, ZoneInfo(tz))
+    period = due_month(subscribed_at, now, interval, tz) or interval
+    if period <= last_month:
+        period = (last_month // interval + 1) * interval
+    # If the current period is still unconsumed and overdue, expose its scheduled date.
+    return (anchor + relativedelta(months=period)).timestamp()
+
+
+def exact_subscription_date(stamp, tz):
+    return datetime.fromtimestamp(stamp, ZoneInfo(tz)).strftime('%d.%m.%Y %H:%M:%S (UTC%z)')
+
+
 def message_parts(payload):
     media = payload.get("media") or []
     text = payload.get("text", "")
